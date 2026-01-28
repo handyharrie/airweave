@@ -88,6 +88,10 @@ class InferredPlan:
 
 
 # Plan configuration
+
+# Plans that can be self-provisioned by users; enterprise requires sales contact
+SELF_SERVE_PLANS = frozenset({BillingPlan.DEVELOPER, BillingPlan.PRO, BillingPlan.TEAM})
+
 PLAN_LIMITS = {
     BillingPlan.DEVELOPER: {
         "max_entities": 50000,

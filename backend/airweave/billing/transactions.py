@@ -145,6 +145,7 @@ class BillingTransactions:
         organization_id: UUID,
         updates: OrganizationBillingUpdate,
         ctx: ApiContext,
+        uow: Optional[UnitOfWork] = None,
     ) -> schemas.OrganizationBilling:
         """Update billing record by organization ID."""
         billing_model = await crud.organization_billing.get_by_organization(
@@ -158,6 +159,7 @@ class BillingTransactions:
             db_obj=billing_model,
             obj_in=updates,
             ctx=ctx,
+            uow=uow,
         )
 
         return schemas.OrganizationBilling.model_validate(updated, from_attributes=True)
@@ -218,8 +220,33 @@ class BillingTransactions:
         stripe_subscription_id: Optional[str] = None,
         previous_period_id: Optional[UUID] = None,
         status: BillingPeriodStatus = BillingPeriodStatus.ACTIVE,
+        uow: Optional[UnitOfWork] = None,
     ) -> schemas.BillingPeriod:
-        """Create a new billing period with usage record."""
+        """Create a new billing period with usage record.
+
+        If previous_period_id is not provided, automatically links to the current
+        active period (if any) within the same transaction scope. This ensures
+        atomic period lookup and creation, avoiding race conditions.
+
+        Args:
+            db: Database session
+            organization_id: Organization ID
+            period_start: Period start datetime
+            period_end: Period end datetime
+            plan: Billing plan
+            transition: Billing transition type
+            ctx: API context
+            stripe_subscription_id: Optional Stripe subscription ID
+            previous_period_id: Optional previous period ID for linkage. If not
+                provided, automatically links to current active period (if any).
+            status: Period status (default: ACTIVE)
+            uow: Optional UnitOfWork for transaction grouping. If provided,
+                 the caller is responsible for committing. If not provided,
+                 a new UOW is created and committed internally.
+
+        Returns:
+            The created billing period
+        """
         # Complete any active periods that would overlap with the new period
         # In test clock scenarios, we need to find periods that would be active
         # just before the new period starts
@@ -244,9 +271,16 @@ class BillingTransactions:
                             "period_end": period_start,  # Ensure continuity
                         },
                         ctx=ctx,
+                        uow=uow,
                     )
-                    if not previous_period_id:
+                    # Auto-populate previous_period_id if not explicitly provided
+                    # This ensures atomic period linkage within the same transaction
+                    if previous_period_id is None:
                         previous_period_id = db_period.id
+        elif previous_period_id is None and current:
+            # Current period exists but doesn't need completion (different status)
+            # Still link to it for audit trail continuity
+            previous_period_id = current.id
 
         # Create new period
         period_create = BillingPeriodCreate(
@@ -260,22 +294,32 @@ class BillingTransactions:
             previous_period_id=previous_period_id,
         )
 
-        period_id = None
-
-        async with UnitOfWork(db) as uow:
-            period = await crud.billing_period.create(db, obj_in=period_create, ctx=ctx, uow=uow)
+        # Helper to create period and usage record within a UOW
+        async def _create_period_and_usage(active_uow: UnitOfWork) -> UUID:
+            period = await crud.billing_period.create(
+                db, obj_in=period_create, ctx=ctx, uow=active_uow
+            )
             await db.flush()
-            period_id = period.id
 
             # Create usage record
             usage_create = UsageCreate(
                 organization_id=organization_id,
                 billing_period_id=period.id,
             )
-            await crud.usage.create(db, obj_in=usage_create, ctx=ctx, uow=uow)
-            await uow.commit()
+            await crud.usage.create(db, obj_in=usage_create, ctx=ctx, uow=active_uow)
+            return period.id
 
-        # After commit, fetch the period fresh to avoid greenlet issues
+        # Use provided UOW or create a new one
+        if uow is not None:
+            # Caller-managed transaction - don't commit, let caller handle it
+            period_id = await _create_period_and_usage(uow)
+        else:
+            # Self-managed transaction - create UOW and commit
+            async with UnitOfWork(db) as internal_uow:
+                period_id = await _create_period_and_usage(internal_uow)
+                await internal_uow.commit()
+
+        # After commit (or flush for caller-managed), fetch the period fresh to avoid greenlet issues
         created_period = await crud.billing_period.get(db, id=period_id, ctx=ctx)
         if not created_period:
             raise InvalidStateError("Failed to create billing period")

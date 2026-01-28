@@ -5,8 +5,11 @@ between the business logic, repository, and Stripe client.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    import stripe
 
 from dateutil.relativedelta import relativedelta
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from airweave import crud, schemas
 from airweave.api.context import ApiContext
 from airweave.billing.plan_logic import (
+    SELF_SERVE_PLANS,
     ChangeType,
     PlanChangeContext,
     analyze_plan_change,
@@ -30,6 +34,7 @@ from airweave.core.shared_models import AuthMethod
 from airweave.db.unit_of_work import UnitOfWork
 from airweave.integrations.stripe_client import stripe_client
 from airweave.models import Organization
+from airweave.schemas.billing_period import BillingTransition
 from airweave.schemas.organization_billing import (
     BillingPlan,
     BillingStatus,
@@ -92,9 +97,7 @@ class BillingService:
 
         # Extract plan from organization metadata
         # SECURITY: Only self-serve plans allowed via user input;
-        # enterprise requires sales
-        SELF_SERVE_PLANS = ["developer", "pro", "team"]
-
+        # enterprise requires sales (SELF_SERVE_PLANS defined in plan_logic.py)
         selected_plan = BillingPlan.PRO  # Default
         if hasattr(organization, "org_metadata") and organization.org_metadata:
             # Check for plan in onboarding metadata (from test/frontend)
@@ -105,8 +108,13 @@ class BillingService:
 
             plan_from_metadata = subscription_plan or direct_plan
             if plan_from_metadata:
-                plan_lower = plan_from_metadata.lower()
-                if plan_lower == "enterprise":
+                # Convert string to BillingPlan enum for type-safe comparison
+                try:
+                    requested_plan = BillingPlan(plan_from_metadata.lower())
+                except ValueError:
+                    requested_plan = None  # Invalid plan string, keep default
+
+                if requested_plan == BillingPlan.ENTERPRISE:
                     log.warning(
                         f"Blocked enterprise plan self-provisioning attempt for org "
                         f"{organization.id}. This may indicate abuse."
@@ -115,8 +123,8 @@ class BillingService:
                         "Enterprise plan is only available via sales. "
                         "Please contact support or select a different plan."
                     )
-                elif plan_lower in SELF_SERVE_PLANS:
-                    selected_plan = BillingPlan(plan_lower)
+                elif requested_plan in SELF_SERVE_PLANS:
+                    selected_plan = requested_plan
 
         # Create billing record
         billing = await billing_transactions.create_billing_record(
@@ -154,6 +162,7 @@ class BillingService:
                             stripe_subscription_id=sub.id,
                         ),
                         ctx=ctx,
+                        uow=uow,
                     )
 
                     log.info(
@@ -168,6 +177,347 @@ class BillingService:
                 )
 
         return billing
+
+    # ------------------------------ Admin Enterprise Billing ------------------------------ #
+
+    async def create_admin_enterprise_billing(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        billing_email: str,
+        uow: UnitOfWork,
+        contextual_logger: Optional[ContextualLogger] = None,
+        source: str = "admin",
+    ) -> schemas.OrganizationBilling:
+        """Create enterprise billing record for admin-initiated signups.
+
+        ADMIN-ONLY: Bypasses self-serve validation. Caller is responsible for
+        ensuring proper authorization before invoking this method.
+
+        Args:
+            db: Database session
+            organization: The organization to create billing for (must be a valid,
+                non-deleted organization - caller is responsible for validation)
+            billing_email: Email for billing communications
+            uow: Unit of work for transaction management
+            contextual_logger: Optional logger
+            source: Source identifier for logging/audit (default: admin)
+
+        Returns:
+            The created billing record
+
+        Raises:
+            InvalidStateError: If Stripe is not enabled, enterprise price not configured,
+                organization already has billing, or organization is in invalid state
+        """
+        log = contextual_logger or logger
+
+        # Validate Stripe is enabled
+        if not stripe_client:
+            raise InvalidStateError("Stripe is not enabled")
+
+        # Validate enterprise price exists
+        price_id = stripe_client.get_price_for_plan(BillingPlan.ENTERPRISE)
+        if not price_id:
+            raise InvalidStateError("Enterprise price ID not configured")
+
+        # Validate organization is in a valid state for billing creation
+        if not organization.id:
+            raise InvalidStateError("Organization has no ID - cannot create billing")
+        if hasattr(organization, "deleted_at") and organization.deleted_at is not None:
+            raise InvalidStateError(
+                f"Organization {organization.id} is deleted - cannot create billing"
+            )
+
+        # Defensive check: ensure organization doesn't already have billing
+        existing = await billing_transactions.get_billing_record(db, organization.id)
+        if existing:
+            raise InvalidStateError(
+                f"Organization {organization.id} already has a billing record"
+            )
+
+        # Create internal system context for billing operations
+        org_schema = schemas.Organization.model_validate(organization, from_attributes=True)
+        ctx = self._create_system_context(org_schema, source)
+
+        # Track Stripe resources for rollback - must be declared before try block
+        # so they're available in except block even if creation fails partway through
+        customer: Optional["stripe.Customer"] = None
+        sub: Optional["stripe.Subscription"] = None
+
+        try:
+            # Create Stripe customer with enterprise metadata
+            customer = await stripe_client.create_customer(
+                email=billing_email,
+                name=organization.name,
+                metadata={
+                    "organization_id": str(organization.id),
+                    "plan": "enterprise",
+                },
+            )
+
+            log.info(f"Created Stripe customer {customer.id} for enterprise org {organization.id}")
+            # Create $0 enterprise subscription
+            sub = await stripe_client.create_subscription(
+                customer_id=customer.id,
+                price_id=price_id,
+                metadata={
+                    "organization_id": str(organization.id),
+                    "plan": "enterprise",
+                },
+            )
+
+            log.info(f"Created $0 enterprise subscription {sub.id} for org {organization.id}")
+
+            # Create billing record via transactions layer
+            billing = await billing_transactions.create_billing_record(
+                db=db,
+                organization_id=organization.id,
+                stripe_customer_id=customer.id,
+                billing_email=billing_email,
+                plan=BillingPlan.ENTERPRISE,
+                ctx=ctx,
+                uow=uow,
+            )
+
+            # Update billing with subscription ID (pass uow for transaction safety)
+            billing = await billing_transactions.update_billing_by_org(
+                db=db,
+                organization_id=organization.id,
+                updates=OrganizationBillingUpdate(
+                    stripe_subscription_id=sub.id,
+                    payment_method_added=True,  # Enterprise doesn't require payment method
+                ),
+                ctx=ctx,
+                uow=uow,
+            )
+
+            # Create initial billing period with usage record
+            # First check if one already exists (idempotency for retries)
+            now = datetime.now(timezone.utc)
+            existing_period = await billing_transactions.get_current_billing_period(
+                db, organization.id
+            )
+
+            if existing_period and existing_period.plan == BillingPlan.ENTERPRISE:
+                log.info(
+                    f"Enterprise billing period already exists for org {organization.id}, "
+                    "skipping period creation"
+                )
+            else:
+                await billing_transactions.create_billing_period(
+                    db=db,
+                    organization_id=organization.id,
+                    period_start=now,
+                    period_end=now + relativedelta(months=1),  # Monthly periods, auto-renewed
+                    plan=BillingPlan.ENTERPRISE,
+                    transition=BillingTransition.INITIAL_SIGNUP,
+                    ctx=ctx,
+                    stripe_subscription_id=sub.id,
+                    uow=uow,
+                    previous_period_id=existing_period.id if existing_period else None,
+                )
+
+            log.info(f"Created enterprise billing record for org {organization.id}")
+            return billing
+
+        except Exception as e:
+            # Rollback Stripe resources on failure
+            # Each cleanup step is wrapped separately to ensure we attempt all cleanups
+            log.error(f"Failed to create enterprise billing, rolling back: {e}")
+
+            # Cancel subscription first if it was created
+            if sub is not None:
+                try:
+                    await stripe_client.cancel_subscription(sub.id, at_period_end=False)
+                    log.info(f"Rolled back Stripe subscription {sub.id}")
+                except Exception as sub_rollback_error:
+                    log.warning(
+                        f"Failed to rollback Stripe subscription {sub.id}: {sub_rollback_error}"
+                    )
+
+            # Then delete the customer (only if it was created)
+            if customer is not None:
+                try:
+                    await stripe_client.delete_customer(customer.id)
+                    log.info(f"Rolled back Stripe customer {customer.id}")
+                except Exception as customer_rollback_error:
+                    log.warning(
+                        f"Failed to rollback Stripe customer {customer.id}: {customer_rollback_error}"
+                    )
+
+            raise
+
+    async def upgrade_to_enterprise_admin(
+        self,
+        db: AsyncSession,
+        organization_id: UUID,
+        uow: UnitOfWork,
+        contextual_logger: Optional[ContextualLogger] = None,
+        source: str = "admin",
+    ) -> schemas.OrganizationBilling:
+        """Upgrade existing organization to enterprise plan (admin-only).
+
+        ADMIN-ONLY: Bypasses self-serve validation. Caller is responsible for
+        ensuring proper authorization before invoking this method.
+
+        Args:
+            db: Database session
+            organization_id: The organization to upgrade
+            uow: Unit of work for transaction management
+            contextual_logger: Optional logger
+            source: Source identifier for logging/audit (default: admin)
+
+        Returns:
+            The updated billing record
+
+        Raises:
+            InvalidStateError: If Stripe is not enabled, enterprise price not configured,
+                org has no Stripe customer, or critical rollback failure occurs
+            NotFoundException: If no billing record exists for the organization
+        """
+        log = contextual_logger or logger
+
+        # Validate Stripe is enabled
+        if not stripe_client:
+            raise InvalidStateError("Stripe is not enabled")
+
+        # Validate enterprise price exists
+        price_id = stripe_client.get_price_for_plan(BillingPlan.ENTERPRISE)
+        if not price_id:
+            raise InvalidStateError("Enterprise price ID not configured")
+
+        # Get existing billing record
+        billing = await billing_transactions.get_billing_record(db, organization_id)
+        if not billing:
+            raise NotFoundException(f"No billing record found for organization {organization_id}")
+
+        # Idempotency check: if already on enterprise, return existing billing
+        if billing.billing_plan == BillingPlan.ENTERPRISE:
+            log.info(f"Org {organization_id} already on enterprise plan, skipping upgrade")
+            return billing
+
+        # Validate stripe_customer_id exists before making Stripe API calls
+        if not billing.stripe_customer_id:
+            raise InvalidStateError(
+                f"Organization {organization_id} has no Stripe customer ID. "
+                "Cannot create subscription without a customer."
+            )
+
+        # Get organization for context creation
+        org_schema = await self._get_organization(db, organization_id)
+        ctx = self._create_system_context(org_schema, source)
+
+        # Store old subscription ID for later cancellation
+        # We create the new subscription FIRST to avoid leaving org without subscription on failure
+        old_subscription_id = billing.stripe_subscription_id
+
+        # Create new $0 enterprise subscription FIRST
+        sub = await stripe_client.create_subscription(
+            customer_id=billing.stripe_customer_id,
+            price_id=price_id,
+            metadata={
+                "organization_id": str(organization_id),
+                "plan": "enterprise",
+            },
+        )
+
+        log.info(f"Created $0 enterprise subscription {sub.id} for org {organization_id}")
+
+        # Cancel old subscription AFTER new one succeeds
+        # If cancellation fails, rollback the new subscription and fail cleanly
+        # Admin operations are rare - better to fail explicitly than leave orphaned subscriptions
+        if old_subscription_id:
+            try:
+                await stripe_client.cancel_subscription(old_subscription_id, at_period_end=False)
+                log.info(f"Cancelled old subscription {old_subscription_id}")
+            except Exception as e:
+                # Rollback the new subscription we just created
+                log.error(f"Failed to cancel old subscription {old_subscription_id}: {e}")
+                try:
+                    await stripe_client.cancel_subscription(sub.id, at_period_end=False)
+                    log.info(f"Rolled back new subscription {sub.id}")
+                except Exception as rollback_err:
+                    # Critical: We have an orphaned subscription that couldn't be cleaned up
+                    log.critical(
+                        f"MANUAL INTERVENTION REQUIRED: Failed to rollback new subscription "
+                        f"{sub.id} after old subscription cancellation failed: {rollback_err}"
+                    )
+                    # Surface orphaned subscription in exception so caller/monitoring can act
+                    raise InvalidStateError(
+                        f"CRITICAL: Orphaned subscription {sub.id} created but rollback failed. "
+                        f"Original error: could not cancel old subscription {old_subscription_id}. "
+                        f"Rollback error: {rollback_err}. "
+                        "Manual cleanup required in Stripe dashboard."
+                    ) from e
+                raise InvalidStateError(
+                    f"Could not cancel old subscription {old_subscription_id}. "
+                    "Upgrade aborted. Please check Stripe dashboard and retry."
+                )
+
+        try:
+            # Update billing record with new subscription and plan (pass uow for transaction safety)
+            billing = await billing_transactions.update_billing_by_org(
+                db=db,
+                organization_id=organization_id,
+                updates=OrganizationBillingUpdate(
+                    stripe_subscription_id=sub.id,
+                    billing_plan=BillingPlan.ENTERPRISE,
+                    billing_status=BillingStatus.ACTIVE,
+                    payment_method_added=True,  # Enterprise doesn't require payment method
+                    cancel_at_period_end=False,
+                    pending_plan_change=None,
+                    pending_plan_change_at=None,
+                    # Clear yearly prepay flags if any
+                    has_yearly_prepay=False,
+                    yearly_prepay_started_at=None,
+                    yearly_prepay_expires_at=None,
+                    yearly_prepay_coupon_id=None,
+                    yearly_prepay_amount_cents=None,
+                ),
+                ctx=ctx,
+                uow=uow,
+            )
+
+            # Create new billing period for enterprise
+            # First check if one already exists for this plan (idempotency)
+            now = datetime.now(timezone.utc)
+            current_period = await billing_transactions.get_current_billing_period(
+                db, organization_id
+            )
+
+            if current_period and current_period.plan == BillingPlan.ENTERPRISE:
+                log.info(
+                    f"Enterprise billing period already exists for org {organization_id}, "
+                    "skipping period creation"
+                )
+            else:
+                await billing_transactions.create_billing_period(
+                    db=db,
+                    organization_id=organization_id,
+                    period_start=now,
+                    period_end=now + relativedelta(months=1),  # Monthly periods, auto-renewed
+                    plan=BillingPlan.ENTERPRISE,
+                    transition=BillingTransition.UPGRADE,
+                    ctx=ctx,
+                    stripe_subscription_id=sub.id,
+                    uow=uow,
+                    previous_period_id=current_period.id if current_period else None,
+                )
+
+            # Caller commits via uow.commit()
+            log.info(f"Upgraded org {organization_id} to enterprise plan")
+            return billing
+
+        except Exception as e:
+            # Rollback the subscription we just created
+            log.error(f"Failed to upgrade to enterprise, rolling back subscription: {e}")
+            try:
+                await stripe_client.cancel_subscription(sub.id, at_period_end=False)
+                log.info(f"Rolled back Stripe subscription {sub.id}")
+            except Exception as rollback_error:
+                log.warning(f"Failed to rollback Stripe subscription: {rollback_error}")
+            raise
 
     # Subscription management
     # ------------------------------ Helpers (internal) ------------------------------ #
@@ -507,8 +857,6 @@ class BillingService:
             # Note: The webhook handler will also create a period, but our repository
             # handles duplicates by completing the existing one first
 
-            from airweave.schemas.billing_period import BillingTransition
-
             now = datetime.now(timezone.utc)
 
             # Check if we already have an active period for the target plan
@@ -531,6 +879,7 @@ class BillingService:
                     transition=BillingTransition.UPGRADE,  # Yearly commitment is an upgrade
                     ctx=ctx,
                     stripe_subscription_id=billing.stripe_subscription_id,
+                    previous_period_id=current_period.id if current_period else None,
                 )
 
             return result
@@ -622,12 +971,15 @@ class BillingService:
                 # Create new billing period for the upgrade
                 # This will automatically create usage records with correct limits
 
-                from airweave.schemas.billing_period import BillingTransition
-
                 now = datetime.now(timezone.utc)
                 # Calculate period end (30 days for monthly)
 
                 period_end = now + relativedelta(months=1)
+
+                # Get current period for linkage
+                current_period = await billing_transactions.get_current_billing_period(
+                    db, ctx.organization.id
+                )
 
                 await billing_transactions.create_billing_period(
                     db,
@@ -638,6 +990,7 @@ class BillingService:
                     transition=BillingTransition.UPGRADE,
                     ctx=ctx,
                     stripe_subscription_id=billing.stripe_subscription_id,
+                    previous_period_id=current_period.id if current_period else None,
                 )
 
                 return f"Successfully upgraded to {target_plan.value} plan"

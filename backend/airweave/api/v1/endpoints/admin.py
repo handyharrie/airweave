@@ -28,12 +28,10 @@ from airweave.core.temporal_service import temporal_service
 from airweave.crud.crud_organization_billing import organization_billing
 from airweave.db.unit_of_work import UnitOfWork
 from airweave.integrations.auth0_management import auth0_management_client
-from airweave.integrations.stripe_client import stripe_client
 from airweave.models.organization import Organization
 from airweave.models.organization_billing import OrganizationBilling
 from airweave.models.user_organization import UserOrganization
 from airweave.platform.sync.config import SyncConfig
-from airweave.schemas.organization_billing import BillingPlan, BillingStatus
 
 router = TrailingSlashRouter()
 
@@ -605,18 +603,18 @@ async def add_self_to_organization(
 
 
 @router.post("/organizations/{organization_id}/upgrade-to-enterprise")
-async def upgrade_organization_to_enterprise(  # noqa: C901
+async def upgrade_organization_to_enterprise(
     organization_id: UUID,
     db: AsyncSession = Depends(deps.get_db),
     ctx: ApiContext = Depends(deps.get_context),
 ) -> schemas.Organization:
     """Upgrade an organization to enterprise plan (admin only).
 
-    Uses the existing billing service infrastructure to properly handle
-    enterprise upgrades with Stripe customer and $0 subscription management.
+    Uses the billing service to properly handle enterprise upgrades with
+    Stripe customer and $0 subscription management.
 
-    For new billing: Creates Stripe customer + $0 enterprise subscription
-    For existing billing: Upgrades plan using billing service
+    For new billing: Creates Stripe customer + $0 enterprise subscription + billing period
+    For existing billing: Cancels old subscription and creates new enterprise one
 
     Args:
         organization_id: The organization to upgrade
@@ -636,16 +634,14 @@ async def upgrade_organization_to_enterprise(  # noqa: C901
     if not org:
         raise NotFoundException(f"Organization {organization_id} not found")
 
-    org_schema = schemas.Organization.model_validate(org, from_attributes=True)
-
     # Check if billing record exists
     billing = await organization_billing.get_by_organization(db, organization_id=organization_id)
 
     if not billing:
-        # No billing record - create one using the billing service
+        # No billing record - create one using the billing service admin method
         ctx.logger.info(f"Creating enterprise billing for org {organization_id}")
 
-        # Get owner email
+        # Get owner email for billing
         owner_email = ctx.user.email if ctx.user else "admin@airweave.ai"
         stmt = select(UserOrganization).where(
             UserOrganization.organization_id == organization_id,
@@ -663,84 +659,35 @@ async def upgrade_organization_to_enterprise(  # noqa: C901
             if owner_user:
                 owner_email = owner_user.email
 
-        # Set enterprise in org metadata for billing service
-        if not org.org_metadata:
-            org.org_metadata = {}
-        org.org_metadata["plan"] = "enterprise"
-        await db.flush()
-
-        # Create system context for billing operations
-        internal_ctx = billing_service._create_system_context(org_schema, "admin_upgrade")
-
-        # Create Stripe customer
-        if not stripe_client:
-            raise InvalidStateError("Stripe is not enabled")
-
-        customer = await stripe_client.create_customer(
-            email=owner_email,
-            name=org.name,
-            metadata={
-                "organization_id": str(organization_id),
-                "plan": "enterprise",
-            },
-        )
-
-        # Use billing service to create record (handles $0 subscription)
         async with UnitOfWork(db) as uow:
-            await billing_service.create_billing_record(
+            await billing_service.create_admin_enterprise_billing(
                 db=db,
                 organization=org,
-                stripe_customer_id=customer.id,
                 billing_email=owner_email,
-                ctx=internal_ctx,
                 uow=uow,
+                source="admin_upgrade",
                 contextual_logger=ctx.logger,
             )
             await uow.commit()
+        await db.refresh(org)
 
         ctx.logger.info(f"Created enterprise billing for org {organization_id}")
     else:
-        # Billing exists - cancel old subscription and create new enterprise one
-        # The webhook will handle updating billing record and creating periods
+        # Billing exists - use the upgrade method
         ctx.logger.info(f"Upgrading org {organization_id} to enterprise")
 
-        # Cancel existing subscription if any
-        if billing.stripe_subscription_id:
-            try:
-                await stripe_client.cancel_subscription(
-                    billing.stripe_subscription_id, at_period_end=False
-                )
-                ctx.logger.info(f"Cancelled subscription {billing.stripe_subscription_id}")
-            except Exception as e:
-                ctx.logger.warning(f"Failed to cancel subscription: {e}")
+        async with UnitOfWork(db) as uow:
+            await billing_service.upgrade_to_enterprise_admin(
+                db=db,
+                organization_id=organization_id,
+                uow=uow,
+                source="admin_upgrade",
+                contextual_logger=ctx.logger,
+            )
+            await uow.commit()
+        await db.refresh(org)
 
-        # Create new $0 enterprise subscription
-        # Webhook will update billing record with subscription_id, plan, periods, etc.
-        if stripe_client:
-            price_id = stripe_client.get_price_for_plan(BillingPlan.ENTERPRISE)
-            if price_id:
-                sub = await stripe_client.create_subscription(
-                    customer_id=billing.stripe_customer_id,
-                    price_id=price_id,
-                    metadata={
-                        "organization_id": str(organization_id),
-                        "plan": "enterprise",
-                    },
-                )
-                ctx.logger.info(
-                    f"Created $0 enterprise subscription {sub.id}, "
-                    f"webhook will update billing record"
-                )
-            else:
-                raise InvalidStateError("Enterprise price ID not configured")
-        else:
-            raise InvalidStateError("Stripe is not enabled")
-
-        await db.commit()
-        ctx.logger.info(f"Enterprise subscription created for org {organization_id}")
-
-    # Refresh and return
-    await db.refresh(org)
+        ctx.logger.info(f"Upgraded org {organization_id} to enterprise")
     await context_cache.invalidate_organization(organization_id)
     return schemas.Organization.model_validate(org)
 
@@ -754,7 +701,8 @@ async def create_enterprise_organization(
 ) -> schemas.Organization:
     """Create a new enterprise organization (admin only).
 
-    This creates an organization directly on the enterprise plan.
+    This creates an organization directly on the enterprise plan with proper
+    billing setup via the billing service.
 
     Args:
         organization_data: The organization data
@@ -778,11 +726,7 @@ async def create_enterprise_organization(
 
     # Create organization with enterprise billing
     async with UnitOfWork(db) as uow:
-        # Create the organization (without Auth0/Stripe integration to avoid automatic trial setup)
-        from airweave.core.datetime_utils import utc_now_naive
-        from airweave.models.organization import Organization
-        from airweave.models.organization_billing import OrganizationBilling
-
+        # Create the organization directly (bypassing normal signup flow)
         org = Organization(
             name=organization_data.name,
             description=organization_data.description,
@@ -801,32 +745,21 @@ async def create_enterprise_organization(
         )
         uow.session.add(user_org)
 
-        # Create Stripe customer
+        # Create enterprise billing using the billing service admin method
         try:
-            customer = await stripe_client.create_customer(
-                email=owner_email,
-                name=org.name,
-                metadata={"organization_id": str(org.id), "plan": "enterprise"},
-            )
-
-            # Create enterprise billing record
-            billing = OrganizationBilling(
-                organization_id=org.id,
-                stripe_customer_id=customer.id,
-                stripe_subscription_id=None,
-                billing_plan="enterprise",
-                billing_status=BillingStatus.ACTIVE,
+            await billing_service.create_admin_enterprise_billing(
+                db=db,
+                organization=org,
                 billing_email=owner_email,
-                payment_method_added=True,
-                current_period_start=utc_now_naive(),
-                current_period_end=None,
+                uow=uow,
+                source="admin_create_enterprise",
+                contextual_logger=ctx.logger,
             )
-            uow.session.add(billing)
         except Exception as e:
-            ctx.logger.error(f"Failed to create Stripe customer for enterprise org: {e}")
+            ctx.logger.error(f"Failed to create enterprise billing for org: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to create billing: {str(e)}")
 
-        await uow.session.commit()
+        await uow.commit()
         await uow.session.refresh(org)
 
         ctx.logger.info(f"Created enterprise organization {org.id} for {owner_email}")
